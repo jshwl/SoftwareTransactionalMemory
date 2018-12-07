@@ -180,6 +180,7 @@ static bool lock_acquire(struct lock_t* lock) {
 
 /** Release the given lock.
  * @param lock Lock to release
+ this will also need to set the mem_unit->lock_flag to false
 **/
 static void lock_release(struct lock_t* lock) {
     pthread_mutex_unlock(&(lock->mutex));

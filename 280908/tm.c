@@ -70,14 +70,13 @@
 /* Implementation 
   */
 // Constants to define whether tx is read only or write
-static const tx_t read_only_tx  = UINTPTR_MAX - 10;
-static const tx_t read_write_tx = UINTPTR_MAX - 11;
+// static const tx_t read_only_tx  = UINTPTR_MAX - 10;
+// static const tx_t read_write_tx = UINTPTR_MAX - 11;
 
  // Lock -> readwrite_lock (so both shared and exclusive modes)
 // check better, perhaps pthread_rwlock is the one you need
 struct lock_t {
-    //pthread_mutex_t mutex;
-    pthread_mutex_trylock trylock;
+    pthread_mutex_t mutex;
 };
 // Lock Operations
 
@@ -96,16 +95,9 @@ static bool lock_acquire(struct lock_t* lock) {
 static void lock_release(struct lock_t* lock) {
     pthread_mutex_unlock(&(lock->mutex));
 }
-// shared lock access
-static bool lock_acquire_shared(struct lock_t* lock) {
-    return lock_acquire(lock);
-}
-static void lock_release_shared(struct lock_t* lock) {
-    lock_release(lock);
-}
 
 
-// Link
+// Link -> Delete
 struct link {
     struct link* prev; // Previous link in the chain
     struct link* next; // Next link in the chain
@@ -131,12 +123,24 @@ static void link_remove(struct link* link) {
     prev->next = next;
     next->prev = prev;
 }
- // Array -> having value, ts, lock)
-typedef struct{
-    pthread_mutex_trylock lock;
-    unsigned_int ts;
-}t_variables;
+// get nb items
 
+size_t get_nb_items(size_t size, size_t align){
+    return (size_t)size/align;
+}
+
+ // T-variables (value, ts, lock)
+typedef struct{
+    void * value;
+    pthread_mutex_t * l_mutex;
+    unsigned int ts;
+}local_t_variables;
+
+typedef struct{
+    pthread_mutex_t mutex;
+    bool lock_flag;
+    unsigned int ts;
+}global_t_variables;
 
  // Memory Region having -> Array 
 struct region {
@@ -146,7 +150,8 @@ struct region {
     size_t size;        // Size of the shared memory region (in bytes)
     size_t align;       // Claimed alignment of the shared memory region (in bytes)
     size_t align_alloc; // Actual alignment of the memory allocations (in bytes)
-    size_t delta_alloc; // Space to add at the beginning of the segment for the link chain (in bytes)
+    global_t_variables t_var
+    //size_t delta_alloc; // Space to add at the beginning of the segment for the link chain (in bytes)
 };
 
 
@@ -168,18 +173,27 @@ shared_t tm_create(size_t size as(unused), size_t align as(unused)) {
         free(region);
         return invalid_shared;
     }
-    // init locks 
     
     // initialize the first segment with zeros
     memset(region->start, 0, size);
-    // treat memory segments as links
     
     // initialize region elements
     region->size        = size;
     region->align       = align;
     region->align_alloc = align_alloc;
-    // decide whether using delta_alloc
-    region->delta_alloc = (sizeof(struct link) + align_alloc - 1) / align_alloc * align_alloc;
+    size_t nb_items = size / align;
+    global_t_variables * t_vars = (global_t_variables*) calloc(nb_items, sizeof(global_t_variables));
+    if (unlikely(!t_vars)) {
+        free(region);
+        return invalid_shared;
+    }
+    region->t_var = t_vars;
+    // initialize all the locks
+    for(size_t i = 0; i< nb_items; i++){
+        lock_init(region->t_var[i].mutex);
+        region->t_var[i].lock_flag = false;
+        region->t_var[i].ts = 0u; // should be zero by defaut CHECK
+    }
     return region;
     
 }
@@ -188,11 +202,11 @@ shared_t tm_create(size_t size as(unused), size_t align as(unused)) {
  * @param shared Shared memory region to destroy, with no running transaction
 **/
 void tm_destroy(shared_t shared as(unused)) {
-    // TODO:
     struct region* region = (struct region*) shared;
+    // should check that all locks are free, i.e. no write transaction ongoing 
+    
     // and remove all subsequent links + free the memory
-    // ...
-    // free the start pointer and the region
+    free(region->t_var);
     free(region->start);
     free(region);
 }
@@ -202,7 +216,6 @@ void tm_destroy(shared_t shared as(unused)) {
  * @return Start address of the first allocated segment
 **/
 void* tm_start(shared_t shared as(unused)) {
-    // √
     return ((struct region*) shared)->start;
 }
 
@@ -211,7 +224,6 @@ void* tm_start(shared_t shared as(unused)) {
  * @return First allocated segment size
 **/
 size_t tm_size(shared_t shared as(unused)) {
-    // √
     return ((struct region*) shared)->size; 
 }
 
@@ -230,7 +242,12 @@ size_t tm_align(shared_t shared as(unused)) {
  * @return Opaque transaction ID, 'invalid_tx' on failure
 **/
 tx_t tm_begin(shared_t shared as(unused), bool is_ro as(unused)) {
-    // TODO: 
+    if(is_ro){
+        
+    }
+    else{
+        
+    }
     return invalid_tx;
 }
 
@@ -252,9 +269,25 @@ bool tm_end(shared_t shared as(unused), tx_t tx as(unused)) {
  * @param target Target start address (in a private region)
  * @return Whether the whole transaction can continue
 **/
+
+bool tm_validate(){
+    
+}
+
+// get t_var index
+size_t get_index(shared_t shared, void const* source as(unused)){
+    void * start = tm_start(shared);
+    return (source - start) / tm_align(shared);
+}
 bool tm_read(shared_t shared as(unused), tx_t tx as(unused), void const* source as(unused), size_t size as(unused), void* target as(unused)) {
-    // TODO: tm_read(shared_t, tx_t, void const*, size_t, void*)
-    return false;
+    // check whether size is valid
+    size_t align = tm_align(shared);
+    if(size % align != 0){
+        return false;
+    }
+    size_t mem_index = get_index(shared, source);
+    size_t nb_items = get_nb_items(size, align);
+    for ()
 }
 
 /** [thread-safe] Write operation in the given transaction, source in a private region and target in the shared region.
