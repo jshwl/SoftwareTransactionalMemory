@@ -1,6 +1,6 @@
 /**
  * @file   tm.c
- * @author [...]
+ * @author [Joseph Vavalà]
  *
  * @section LICENSE
  *
@@ -96,39 +96,6 @@ static void lock_release(struct lock_t* lock) {
     pthread_mutex_unlock(&(lock->mutex));
 }
 
-
-// Link -> Delete
-struct link {
-    struct link* prev; // Previous link in the chain
-    struct link* next; // Next link in the chain
-};
-
- // Link Operations
-static void link_reset(struct link* link) {
-    link->prev = link;
-    link->next = link;
-}
-
-static void link_insert(struct link* link, struct link* base) {
-    struct link* prev = base->prev;
-    link->prev = prev;
-    link->next = base;
-    base->prev = link;
-    prev->next = link;
-}
-
-static void link_remove(struct link* link) {
-    struct link* prev = link->prev;
-    struct link* next = link->next;
-    prev->next = next;
-    next->prev = prev;
-}
-// get nb items
-
-size_t get_nb_items(size_t size, size_t align){
-    return (size_t)size/align;
-}
-
  // T-variables (value, ts, lock)
 typedef struct{
     void * value;
@@ -136,22 +103,40 @@ typedef struct{
     unsigned int ts;
 }local_t_variables;
 
+// get how many items will be used in the operation
+size_t get_nb_items(size_t size, size_t align){
+    return (size_t)size/align;
+}
+
+// get t_var index
+size_t get_index(shared_t shared, void const* source as(unused)){
+    void * start = tm_start(shared);
+    return (source - start) / tm_align(shared);
+}
+
 typedef struct{
+    unsigned int ts;
     pthread_mutex_t mutex;
     bool lock_flag;
-    unsigned int ts;
-}global_t_variables;
+}t_variables;
+
+typedef struct{
+    bool readonly;
+    void * readset; // array of integers
+    void * writeset; // array of integers
+    void * initial_vals;
+    void * initial_ts;
+    void * timestamps;
+}transaction;
 
  // Memory Region having -> Array 
 struct region {
-    struct lock_t lock; // Global lock
     void* start;        // Start of the shared memory region
     struct link allocs; // Allocated shared memory regions
     size_t size;        // Size of the shared memory region (in bytes)
     size_t align;       // Claimed alignment of the shared memory region (in bytes)
     size_t align_alloc; // Actual alignment of the memory allocations (in bytes)
-    global_t_variables t_var
-    //size_t delta_alloc; // Space to add at the beginning of the segment for the link chain (in bytes)
+    t_variables t_var;
 };
 
 
@@ -174,7 +159,7 @@ shared_t tm_create(size_t size as(unused), size_t align as(unused)) {
         return invalid_shared;
     }
     
-    // initialize the first segment with zeros
+    // initialize the region with zeros
     memset(region->start, 0, size);
     
     // initialize region elements
@@ -182,17 +167,18 @@ shared_t tm_create(size_t size as(unused), size_t align as(unused)) {
     region->align       = align;
     region->align_alloc = align_alloc;
     size_t nb_items = size / align;
-    global_t_variables * t_vars = (global_t_variables*) calloc(nb_items, sizeof(global_t_variables));
+    // check here
+    t_variables * t_vars = (t_variables*) calloc(nb_items, sizeof(t_variables));
     if (unlikely(!t_vars)) {
         free(region);
         return invalid_shared;
     }
     region->t_var = t_vars;
     // initialize all the locks
-    for(size_t i = 0; i< nb_items; i++){
+    for(size_t i = 0; i < nb_items; i++){
         lock_init(region->t_var[i].mutex);
         region->t_var[i].lock_flag = false;
-        region->t_var[i].ts = 0u; // should be zero by defaut CHECK
+        region->t_var[i].ts = 0u; // should be zero by defaut but CHECK
     }
     return region;
     
@@ -242,13 +228,53 @@ size_t tm_align(shared_t shared as(unused)) {
  * @return Opaque transaction ID, 'invalid_tx' on failure
 **/
 tx_t tm_begin(shared_t shared as(unused), bool is_ro as(unused)) {
+    transaction* tx = (transaction*) malloc(sizeof(transaction)); //allocate memory to store transaction's data 
+    if (unlikely(!tx)) {
+        return invalid_tx;
+    }
+    tx->readonly = is_ro;
+    size_t size = tm_size(shared);
+    size_t align = tm_align(shared);
+    size_t nb_items = get_nb_items(size, align);
+    
     if(is_ro){
+        int * rset = NULL;
+        rset = (int *) malloc(nb_items * sizeof(int));
+        int * timest = NULL;
+        timest = (int *) malloc(nb_items * sizeof(int));
         
+        for(size_t i = 0; i< nb_items; i++){
+            rset[i] = 0;
+            timest[i] = 0;
+        }
+        tx->readset = rset;
+        tx->timestamps = timest;
     }
     else{
+        int * wset = NULL;
+        wset = (int *) malloc(nb_items * sizeof(int));
+        int * rset = NULL;
+        rset = (int *) malloc(nb_items * sizeof(int));
+        int * timest = NULL;
+        timest = (int *) malloc(nb_items * sizeof(int));
+        int * init_ts = NULL;
+        init_ts = (int *) malloc(nb_items * sizeof(int));
         
+        // init initial_values array -> x nb_items HERE
+        tx.initial_vals = NULL;
+        
+        for(size_t i = 0; i< nb_items; i++){
+            wset[i] = 0;
+            rset[i] = 0;
+            timest[i] = 0;
+            init_ts[i] = 0;
+        }
+        tx->writeset    = wset;
+        tx->readset     = rset;
+        tx->timestamps  = timest;
+        tx->initial_ts  = init_ts;
     }
-    return invalid_tx;
+    return tx;
 }
 
 /** [thread-safe] End the given transaction.
@@ -274,20 +300,30 @@ bool tm_validate(){
     
 }
 
-// get t_var index
-size_t get_index(shared_t shared, void const* source as(unused)){
-    void * start = tm_start(shared);
-    return (source - start) / tm_align(shared);
-}
 bool tm_read(shared_t shared as(unused), tx_t tx as(unused), void const* source as(unused), size_t size as(unused), void* target as(unused)) {
-    // check whether size is valid
+    // check size validity
     size_t align = tm_align(shared);
     if(size % align != 0){
         return false;
     }
     size_t mem_index = get_index(shared, source);
     size_t nb_items = get_nb_items(size, align);
-    for ()
+    
+    // first if m belongs to wset
+    if(!tx->readonly){
+        for(size_t i = mem_index; i < (nb_items + mem_index); i++){
+            if(tx->writeset[i]==0){ // item not in tx write_set
+                if(shared->t_var[i].lock_flag == true){
+                    // call tm_abort
+                    return false;
+                }
+                break;
+            }
+            else if(i == (nb_items + mem_index - 1)){
+                memcpy(target, source, size); // HERE
+            }
+    }
+    
 }
 
 /** [thread-safe] Write operation in the given transaction, source in a private region and target in the shared region.
