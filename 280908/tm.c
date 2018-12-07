@@ -310,7 +310,7 @@ bool tm_read(shared_t shared as(unused), tx_t tx as(unused), void const* source 
     size_t nb_items = get_nb_items(size, align);
     
     // first if m belongs to wset
-    if(!tx->readonly){
+    if(!tx->readonly){ // add if ! tm_validate() -> abort HERE
         for(size_t i = mem_index; i < (nb_items + mem_index); i++){
             if(tx->writeset[i]==0){ // item not in tx write_set
                 if(shared->t_var[i].lock_flag == true){
@@ -321,9 +321,20 @@ bool tm_read(shared_t shared as(unused), tx_t tx as(unused), void const* source 
             }
             else if(i == (nb_items + mem_index - 1)){
                 memcpy(target, source, size); // HERE
+                return true;
             }
     }
-    
+        if(!tm_validate()){ // HERE
+            tm_abort(); 
+        }
+    for(size_t i = mem_index; i < (nb_items + mem_index); i++){
+        if(tx->readset[i]==0){ // item not in tx read_set yet
+            tx->readset[i] = 1;
+            tx->timestamps[i] = (int) shared->t_var[i].ts; // too much granularity in the timestamps, probably this will cause problems
+        }
+    }
+    memcpy(target, source, size); // HERE
+        return true;
 }
 
 /** [thread-safe] Write operation in the given transaction, source in a private region and target in the shared region.
@@ -335,8 +346,29 @@ bool tm_read(shared_t shared as(unused), tx_t tx as(unused), void const* source 
  * @return Whether the whole transaction can continue
 **/
 bool tm_write(shared_t shared as(unused), tx_t tx as(unused), void const* source as(unused), size_t size as(unused), void* target as(unused)) {
-    // TODO: tm_write(shared_t, tx_t, void const*, size_t, void*)
-    return false;
+    size_t align = tm_align(shared);
+    if(size % align != 0){
+        return false;
+    }
+    size_t mem_index = get_index(shared, source);
+    size_t nb_items = get_nb_items(size, align);
+    
+    for(size_t i = mem_index; i < (nb_items + mem_index); i++){
+        if(tx->writeset[i]==0){ // item not in tx write_set
+            if(lock_acquire(shared->t_var[i].mutex)){
+                tx->writeset[i] = 1;
+                tx->initial_ts[i] = (int) shared->t_var[i].ts;
+                // store in tx->initial_vals[i] only that specific fragment of memory 
+            }
+            else{
+                tm_abort(tx); // HERE
+                return false;
+            }
+        }
+    }
+    // perhaps need to update the ts for all to the highest found during the iterations
+    memcpy(target, source, size);
+    return true;
 }
 
 /** [thread-safe] Memory allocation in the given transaction.
