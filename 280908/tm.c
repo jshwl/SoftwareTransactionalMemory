@@ -103,7 +103,6 @@ typedef struct{
     unsigned int ts;
 }local_t_variables;
 
-// get how many items will be used in the operation
 size_t get_nb_items(size_t size, size_t align){
     return (size_t)size/align;
 }
@@ -129,7 +128,6 @@ typedef struct{
     void * timestamps;
 }transaction;
 
- // Memory Region having -> Array 
 struct region {
     void* start;        // Start of the shared memory region
     struct link allocs; // Allocated shared memory regions
@@ -283,7 +281,35 @@ tx_t tm_begin(shared_t shared as(unused), bool is_ro as(unused)) {
  * @return Whether the whole transaction committed
 **/
 bool tm_end(shared_t shared as(unused), tx_t tx as(unused)) {
-    // TODO:
+    size_t size = tm_size(shared);
+    size_t align = tm_align(shared);
+    size_t nb_items = get_nb_items(size, align);
+    
+    if(tx->readonly){
+        // free all R arrays
+        free(tx->readset);
+        free(tx->timestamps);
+        // free transaction
+        free(tx);
+    }
+    else{ // HERE
+        
+        if(!tm_validate(shared, tx)) tm_abort();
+        for(size_t i = 0; i < nb_items; i++){
+            if(tx->writeset[i]==1){
+                shared->t_var[i].ts = tx->timestamps[i] +1;
+                lock_release(shared->t_var[i].mutex);
+                shared->t_var[i].lock_flag = false;
+            }
+        }
+        // free all W arrays
+        free(tx->writeset);
+        free(tx->readset);
+        free(tx->timestamps);
+        free(tx->initial_ts);
+        // free initial_vals HERE
+        free(tx);
+    }
     return false;
 }
 
@@ -296,7 +322,7 @@ bool tm_end(shared_t shared as(unused), tx_t tx as(unused)) {
  * @return Whether the whole transaction can continue
 **/
 
-bool tm_validate(){
+bool tm_validate(shared_t shared as(unused), tx_t tx as(unused)){
     
 }
 
