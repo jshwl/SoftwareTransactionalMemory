@@ -96,13 +96,6 @@ static void lock_release(struct lock_t* lock) {
     pthread_mutex_unlock(&(lock->mutex));
 }
 
- // T-variables (value, ts, lock)
-typedef struct{
-    void * value;
-    pthread_mutex_t * l_mutex;
-    unsigned int ts;
-}local_t_variables;
-
 size_t get_nb_items(size_t size, size_t align){
     return (size_t)size/align;
 }
@@ -135,6 +128,8 @@ struct region {
     size_t align;       // Claimed alignment of the shared memory region (in bytes)
     size_t align_alloc; // Actual alignment of the memory allocations (in bytes)
     t_variables t_var;
+    
+    size_t nb_itemz; // nb of items for easier retrieval
 };
 
 
@@ -165,6 +160,7 @@ shared_t tm_create(size_t size as(unused), size_t align as(unused)) {
     region->align       = align;
     region->align_alloc = align_alloc;
     size_t nb_items = size / align;
+    region->nb_itemz = nb_items;
     // check here
     t_variables * t_vars = (t_variables*) calloc(nb_items, sizeof(t_variables));
     if (unlikely(!t_vars)) {
@@ -280,9 +276,10 @@ tx_t tm_begin(shared_t shared as(unused), bool is_ro as(unused)) {
  * @return Whether the whole transaction committed
 **/
 bool tm_end(shared_t shared as(unused), tx_t tx as(unused)) {
-    size_t size = tm_size(shared);
-    size_t align = tm_align(shared);
-    size_t nb_items = get_nb_items(size, align);
+    // replace with shared->nb_itemz HERE
+    //size_t size = tm_size(shared);
+    //size_t align = tm_align(shared);
+    size_t nb_items = shared->nb_itemz;
     
     if(tx->readonly){
         // free all R arrays
@@ -293,7 +290,10 @@ bool tm_end(shared_t shared as(unused), tx_t tx as(unused)) {
     }
     else{ // HERE
         
-        if(!tm_validate(shared, tx)) tm_abort();
+        if(!tm_validate(shared, tx)){ 
+            tm_abort();
+            return false; 
+        }
         for(size_t i = 0; i < nb_items; i++){
             if(tx->writeset[i]==1){
                 shared->t_var[i].ts = tx->timestamps[i] +1;
@@ -323,7 +323,9 @@ bool tm_end(shared_t shared as(unused), tx_t tx as(unused)) {
 
 bool tm_validate(shared_t shared as(unused), tx_t tx as(unused)){
     // get nb_items
-    
+    size_t size = tm_size(shared);
+    size_t align = tm_align(shared);
+    size_t nb_items = size/align;
     // iterate readset
     for(size_t i = 0; i < nb_items; i++){
         if(tx->readset[i]==1){
@@ -337,6 +339,39 @@ bool tm_validate(shared_t shared as(unused), tx_t tx as(unused)){
             }
         }
     }
+    return true;
+}
+
+bool tm_abort(shared_t shared as(unused), tx_t tx as(unused)){ // the grading tool will not call tm_end if tx aborts, hence either I call it or tm_abort takes care of the rollback & memory freeing.
+    if(!tx->readonly){ // if tx performed both w & r
+        size_t nb_items = shared->nb_itemz;
+        for(size_t i = 0; i < nb_items; i++){
+            if(tx->writeset[i]==1){ // rollback values and initial timestamps
+                shared->t_var[i].ts = tx->initial_ts[i];
+                // restore initial values
+                // ...
+                // release locks
+                lock_release(shared->t_var[i].mutex);
+                shared->t_var[i].lock_flag = false;
+            }
+        }
+        // free
+        // free all W arrays
+        free(tx->writeset);
+        free(tx->readset);
+        free(tx->timestamps);
+        free(tx->initial_ts);
+        // free initial_vals HERE
+        free(tx);
+    }
+    else{ // "rollback" for read
+        // free all R arrays
+        free(tx->readset);
+        free(tx->timestamps);
+        // free transaction
+        free(tx);
+    }
+    return true; // HERE
 }
 
 bool tm_read(shared_t shared as(unused), tx_t tx as(unused), void const* source as(unused), size_t size as(unused), void* target as(unused)) {
@@ -365,6 +400,7 @@ bool tm_read(shared_t shared as(unused), tx_t tx as(unused), void const* source 
     }
         if(!tm_validate()){ // HERE
             tm_abort(); 
+            return false;
         }
     for(size_t i = mem_index; i < (nb_items + mem_index); i++){
         if(tx->readset[i]==0){ // item not in tx read_set yet
@@ -400,7 +436,7 @@ bool tm_write(shared_t shared as(unused), tx_t tx as(unused), void const* source
                 // store in tx->initial_vals[i] only that specific fragment of memory 
             }
             else{
-                tm_abort(tx); // HERE
+                tm_abort(shared, tx); // HERE
                 return false;
             }
         }
