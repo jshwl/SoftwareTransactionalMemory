@@ -123,7 +123,7 @@ typedef struct{
     bool readonly;
     void * readset; // array of integers
     void * writeset; // array of integers
-    void * initial_vals;
+    void * initial_vals; // HERE decide how to store them
     void * initial_ts;
     void * timestamps;
 }transaction;
@@ -216,7 +216,6 @@ size_t tm_size(shared_t shared as(unused)) {
  * @return Alignment used globally
 **/
 size_t tm_align(shared_t shared as(unused)) {
-    // √
     return ((struct region*) shared)->align; ;
 }
 
@@ -310,7 +309,7 @@ bool tm_end(shared_t shared as(unused), tx_t tx as(unused)) {
         // free initial_vals HERE
         free(tx);
     }
-    return false;
+    return true;
 }
 
 /** [thread-safe] Read operation in the given transaction, source in the shared region and target in a private region.
@@ -323,7 +322,21 @@ bool tm_end(shared_t shared as(unused), tx_t tx as(unused)) {
 **/
 
 bool tm_validate(shared_t shared as(unused), tx_t tx as(unused)){
+    // get nb_items
     
+    // iterate readset
+    for(size_t i = 0; i < nb_items; i++){
+        if(tx->readset[i]==1){
+            if(tx->readonly){
+                if(shared->t_var[i].ts != tx->timestamps[i]){
+                    return false; // validation failed
+                }
+            }
+            else if((shared->t_var[i].lock_flag == true && tx->writeset[i]==0)){ // if locked and not in this tx wset
+                return false;
+            }
+        }
+    }
 }
 
 bool tm_read(shared_t shared as(unused), tx_t tx as(unused), void const* source as(unused), size_t size as(unused), void* target as(unused)) {
