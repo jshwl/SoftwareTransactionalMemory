@@ -116,20 +116,18 @@ typedef struct{
     bool readonly;
     void * readset; // array of integers
     void * writeset; // array of integers
-    void * initial_vals; // HERE decide how to store them
+    char * local_copy; // array of memory pieces
     void * initial_ts;
     void * timestamps;
 }transaction;
 
 struct region {
     void* start;        // Start of the shared memory region
-    struct link allocs; // Allocated shared memory regions
     size_t size;        // Size of the shared memory region (in bytes)
     size_t align;       // Claimed alignment of the shared memory region (in bytes)
     size_t align_alloc; // Actual alignment of the memory allocations (in bytes)
-    t_variables t_var;
-    
     size_t nb_itemz; // nb of items for easier retrieval
+    t_variables * t_var;
 };
 
 
@@ -162,7 +160,7 @@ shared_t tm_create(size_t size as(unused), size_t align as(unused)) {
     size_t nb_items = size / align;
     region->nb_itemz = nb_items;
     // check here
-    t_variables * t_vars = (t_variables*) calloc(nb_items, sizeof(t_variables));
+    t_variables * t_vars = (t_variables *) calloc(nb_items, sizeof(t_variables));
     if (unlikely(!t_vars)) {
         free(region);
         return invalid_shared;
@@ -215,6 +213,10 @@ size_t tm_align(shared_t shared as(unused)) {
     return ((struct region*) shared)->align; ;
 }
 
+size_t tm_nb_itemz(shared_t shared as(unused)) {
+    return ((struct region*) shared)->itemz; 
+}
+
 /** [thread-safe] Begin a new transaction on the given shared memory region.
  * @param shared Shared memory region to start a transaction on
  * @param is_ro  Whether the transaction is read-only
@@ -229,6 +231,7 @@ tx_t tm_begin(shared_t shared as(unused), bool is_ro as(unused)) {
     size_t size = tm_size(shared);
     size_t align = tm_align(shared);
     size_t nb_items = get_nb_items(size, align);
+    //size_t nb_items = get_nb_items(size, align);
     
     if(is_ro){
         int * rset = NULL;
@@ -253,19 +256,30 @@ tx_t tm_begin(shared_t shared as(unused), bool is_ro as(unused)) {
         int * init_ts = NULL;
         init_ts = (int *) malloc(nb_items * sizeof(int));
         
-        // init initial_values array -> x nb_items HERE
-        tx.initial_vals = NULL;
+        // init array -> x nb_items HERE
+        char * init_v = (char*) calloc(nb_items, sizeof(char))
+        //(t_variables *) calloc(nb_items, sizeof(t_variables));
+        tx.local_copy = NULL; // 
         
+        void* source_item = tm_start(shared);
         for(size_t i = 0; i< nb_items; i++){
+            if(!shared->t_var[i].lock_flag){
+                memcpy(init_v[i], source_item, align);
+            }
+            else{
+                init_v[i] = NULL;
+            }
             wset[i] = 0;
             rset[i] = 0;
             timest[i] = 0;
             init_ts[i] = 0;
+            source_item = (char*) source_item + align;
         }
         tx->writeset    = wset;
         tx->readset     = rset;
         tx->timestamps  = timest;
         tx->initial_ts  = init_ts;
+        tx->local_copy  = init_v;
     }
     return tx;
 }
@@ -278,7 +292,7 @@ tx_t tm_begin(shared_t shared as(unused), bool is_ro as(unused)) {
 bool tm_end(shared_t shared as(unused), tx_t tx as(unused)) {
     // replace with shared->nb_itemz HERE
     //size_t size = tm_size(shared);
-    //size_t align = tm_align(shared);
+    size_t align = tm_align(shared);
     size_t nb_items = shared->nb_itemz;
     
     if(tx->readonly){
@@ -294,9 +308,13 @@ bool tm_end(shared_t shared as(unused), tx_t tx as(unused)) {
             tm_abort();
             return false; 
         }
+        void* public_item = tm_start(shared);
         for(size_t i = 0; i < nb_items; i++){
             if(tx->writeset[i]==1){
                 shared->t_var[i].ts = tx->timestamps[i] +1;
+                memcpy(public_item, tx->local_copy[i], align);
+                public_item = (char *) public_item + align;
+                free(tx->local_copy[i]); // free each piece of local_copy HERE check whether * needed or should "typecast"
                 lock_release(shared->t_var[i].mutex);
                 shared->t_var[i].lock_flag = false;
             }
@@ -345,14 +363,14 @@ bool tm_validate(shared_t shared as(unused), tx_t tx as(unused)){
 bool tm_abort(shared_t shared as(unused), tx_t tx as(unused)){ // the grading tool will not call tm_end if tx aborts, hence either I call it or tm_abort takes care of the rollback & memory freeing.
     if(!tx->readonly){ // if tx performed both w & r
         size_t nb_items = shared->nb_itemz;
+        void* public_item = tm_start(shared);
         for(size_t i = 0; i < nb_items; i++){
-            if(tx->writeset[i]==1){ // rollback values and initial timestamps
-                shared->t_var[i].ts = tx->initial_ts[i];
-                // restore initial values
-                // ...
+            if(tx->writeset[i]==1){ // NO need to rollback values and initial timestamps because they were never written
+                free(tx->local_copy[i]);
                 // release locks
                 lock_release(shared->t_var[i].mutex);
                 shared->t_var[i].lock_flag = false;
+                // restore previous version memcpy(this_align, target in shared, size) HERE
             }
         }
         // free
@@ -362,6 +380,7 @@ bool tm_abort(shared_t shared as(unused), tx_t tx as(unused)){ // the grading to
         free(tx->timestamps);
         free(tx->initial_ts);
         // free initial_vals HERE
+        free(tx->local_copy);
         free(tx);
     }
     else{ // "rollback" for read
@@ -390,11 +409,11 @@ bool tm_read(shared_t shared as(unused), tx_t tx as(unused), void const* source 
                 if(shared->t_var[i].lock_flag == true){
                     // call tm_abort
                     return false;
-                }
+                }// why break here?
                 break;
             }
-            else if(i == (nb_items + mem_index - 1)){
-                memcpy(target, source, size); // HERE
+            if(i == (nb_items + mem_index - 1)){
+                memcpy(target, source, size); // HERE at the end
                 return true;
             }
     }
@@ -410,6 +429,8 @@ bool tm_read(shared_t shared as(unused), tx_t tx as(unused), void const* source 
     }
     memcpy(target, source, size); // HERE
         return true;
+    }
+    
 }
 
 /** [thread-safe] Write operation in the given transaction, source in a private region and target in the shared region.
