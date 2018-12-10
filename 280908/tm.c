@@ -80,20 +80,20 @@ struct lock_t {
 };
 // Lock Operations
 
-static bool lock_init(struct lock_t* lock) {
-    return pthread_mutex_init(&(lock->mutex), NULL) == 0;
+static bool lock_init(pthread_mutex_t * lock) {
+    return pthread_mutex_init((lock), NULL) == 0;
 }
 
-static void lock_cleanup(struct lock_t* lock) {
-    pthread_mutex_destroy(&(lock->mutex));
+static void lock_cleanup(pthread_mutex_t * lock) {
+    pthread_mutex_destroy(lock);
 }
 // exclusive lock access
-static bool lock_acquire(struct lock_t* lock) {
-    return pthread_mutex_lock(&(lock->mutex)) == 0;
+static bool lock_acquire(pthread_mutex_t* lock) {
+    return pthread_mutex_lock(lock) == 0;
 }
 
-static void lock_release(struct lock_t* lock) {
-    pthread_mutex_unlock(&(lock->mutex));
+static void lock_release(pthread_mutex_t * lock) {
+    pthread_mutex_unlock(lock);
 }
 
 size_t get_nb_items(size_t size, size_t align){
@@ -114,8 +114,8 @@ typedef struct{
 
 typedef struct{
     bool readonly;
-    void * readset; // array of integers
-    void * writeset; // array of integers
+    int * readset; // array of integers   // perhaps pointer to pointers of ints
+    int * writeset; // array of integers
     char * local_copy; // array of memory pieces
     void * initial_ts;
     void * timestamps;
@@ -168,7 +168,7 @@ shared_t tm_create(size_t size as(unused), size_t align as(unused)) {
     region->t_var = t_vars;
     // initialize all the locks
     for(size_t i = 0; i < nb_items; i++){
-        lock_init(region->t_var[i].mutex);
+        lock_init(&region->t_var[i].mutex);
         region->t_var[i].lock_flag = false;
         region->t_var[i].ts = 0u; // should be zero by defaut but CHECK
     }
@@ -214,7 +214,7 @@ size_t tm_align(shared_t shared as(unused)) {
 }
 
 size_t tm_nb_itemz(shared_t shared as(unused)) {
-    return ((struct region*) shared)->itemz; 
+    return ((struct region*) shared)->nb_itemz; 
 }
 
 /** [thread-safe] Begin a new transaction on the given shared memory region.
@@ -223,6 +223,8 @@ size_t tm_nb_itemz(shared_t shared as(unused)) {
  * @return Opaque transaction ID, 'invalid_tx' on failure
 **/
 tx_t tm_begin(shared_t shared as(unused), bool is_ro as(unused)) {
+// try to fix request for member in something not a structure or union
+	struct region * share = (struct region *) shared;
     transaction* tx = (transaction*) malloc(sizeof(transaction)); //allocate memory to store transaction's data 
     if (unlikely(!tx)) {
         return invalid_tx;
@@ -257,13 +259,13 @@ tx_t tm_begin(shared_t shared as(unused), bool is_ro as(unused)) {
         init_ts = (int *) malloc(nb_items * sizeof(int));
         
         // init array -> x nb_items HERE
-        char * init_v = (char*) calloc(nb_items, sizeof(char))
+        char * init_v = (char*) calloc(nb_items, sizeof(char));
         //(t_variables *) calloc(nb_items, sizeof(t_variables));
-        tx.local_copy = NULL; // 
+        //tx.local_copy = NULL; // 
         
         void* source_item = tm_start(shared);
         for(size_t i = 0; i< nb_items; i++){
-            if(!shared->t_var[i].lock_flag){
+            if(!(share->t_var[i].lock_flag)){
                 memcpy(init_v[i], source_item, align);
             }
             else{
@@ -290,17 +292,20 @@ tx_t tm_begin(shared_t shared as(unused), bool is_ro as(unused)) {
  * @return Whether the whole transaction committed
 **/
 bool tm_end(shared_t shared as(unused), tx_t tx as(unused)) {
+	transaction * txn = (transaction *) tx;
     // replace with shared->nb_itemz HERE
     //size_t size = tm_size(shared);
     size_t align = tm_align(shared);
-    size_t nb_items = shared->nb_itemz;
+    size_t nb_items = tm_nb_itemz(shared);
     
-    if(tx->readonly){
+    if(txn->readonly){
         // free all R arrays
-        free(tx->readset);
-        free(tx->timestamps);
+        //free(((transaction*)tx)->readset);
+		free(txn->readset);
+        //free(((transaction*)tx)->timestamps);
+		free(txn->timestamps);
         // free transaction
-        free(tx);
+        free(txn);
     }
     else{ // HERE
         
@@ -310,7 +315,7 @@ bool tm_end(shared_t shared as(unused), tx_t tx as(unused)) {
         }
         void* public_item = tm_start(shared);
         for(size_t i = 0; i < nb_items; i++){
-            if(tx->writeset[i]==1){
+            if(txn->writeset[i]) == 1){
                 shared->t_var[i].ts = tx->timestamps[i] +1;
                 memcpy(public_item, tx->local_copy[i], align);
                 public_item = (char *) public_item + align;
