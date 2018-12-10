@@ -108,7 +108,7 @@ size_t get_index(shared_t shared, void const* source as(unused)){
 }
 
 typedef struct{
-    int ts; // unsigned
+    atomic_uint ts; // atomic unsigned
     pthread_mutex_t mutex;
     bool lock_flag;
 }t_variables;
@@ -118,7 +118,7 @@ typedef struct{
     int * readset; // array of integers   // perhaps pointer to pointers of ints 
     int * writeset; // array of integers  // before void * rset; // int wset[] because only one flexible array is allowed
     char * local_copy; // array of memory pieces
-    //int * initial_ts; // not useful as tm_write won't write and rollback but only commit at tm_end
+    //atomic_uint * timestamps;
     int * timestamps;
 }transaction;
 
@@ -170,7 +170,8 @@ shared_t tm_create(size_t size as(unused), size_t align as(unused)) {
     for(size_t i = 0; i < nb_items; i++){
         lock_init(&t_vars[i].mutex);
         t_vars[i].lock_flag = false; // before it was region->t_var[i]...
-        t_vars[i].ts = 0u; // should be zero by defaut but CHECK
+        //t_vars[i].ts = 0u; // can I do
+        atomic_init(&t_vars[i].ts,0u);
     }
 	region->t_var = t_vars;
     return region;
@@ -290,13 +291,13 @@ tx_t tm_begin(shared_t shared as(unused), bool is_ro as(unused)) {
     size_t align = tm_align(shared);
 	size_t nb_items = tm_nb_itemz(share);
     //transaction* tx = (transaction*) malloc(sizeof(transaction)); // careful, things could be in positions other than you think. + nb_items * sizeof(int));
-	transaction* tx = (transaction*) malloc(sizeof(transaction);
+	transaction* tx = (transaction*) malloc(sizeof(transaction));
     if (unlikely(!tx)) {
         return invalid_tx;
     }
     tx->readonly = is_ro;
     
-    if(is_ro){ // try to return immediately when this calls read
+    if(is_ro){ // try to return immediately when this calls read -> so just return true and in tm_read if(txn->readonly) memcpy()...
         int * rset = NULL;
         rset = (int *) malloc(nb_items * sizeof(int));
 		if (unlikely(!rset)) {
@@ -328,35 +329,45 @@ tx_t tm_begin(shared_t shared as(unused), bool is_ro as(unused)) {
         if (unlikely(!rset)) {
       	  return invalid_tx;
   		}
-        
-        int * timest = NULL;
-        timest = (int *) malloc(nb_items * sizeof(int));
+  		
+        /* // atomic version on transactions too
+        (atomic_uint *) timest = (atomic *) calloc(nb_items, sizeof(atomic_uint)); // or malloc, with calloc all init to 0
         if (unlikely(!timest) {
         	return invalid_tx;
     	}
-        
+    	*/
+        int * timest = NULL;
+        timest = (int *) malloc(nb_items * sizeof(int));
+        if (unlikely(!timest)) {
+        	return invalid_tx;
+   		}
+   		
+   		
         char * init_v = (char*) calloc(nb_items, sizeof(align)); // 
-        if (unlikely(!init_v) {
+        if (unlikely(!init_v)){
         	return invalid_tx;
     	}
         
         void* source_item = tm_start(shared);
         for(size_t i = 0; i< nb_items; i++){
-            if(!(share->t_var[i].lock_flag)){
+            //atomic_init(timest[i],0u);
+        }
+        for(size_t i = 0; i< nb_items; i++){
+            if(!(share->t_var[i].lock_flag)){ // should it have [i*align too?]
+                timest[i] = atomic_load_explicit(&share->t_var[i].ts, memory_order_acquire);
                 memcpy(init_v[i*align], source_item, align); // because otherwise 1-elem at a time
             }
             else{
+                timest[i] = atomic_load_explicit(&share->t_var[i].ts, memory_order_acquire);
                 init_v[i] = NULL;
             }
             wset[i] = 0;
             rset[i] = 0;
-            timest[i] = 0;
             source_item = (char*) source_item + align;
         }
         tx->writeset    = wset;
         tx->readset     = rset;
         tx->timestamps  = timest;
-        //tx->initial_ts  = init_ts;
         tx->local_copy  = init_v;
     }
     return tx;
@@ -393,7 +404,7 @@ bool tm_end(shared_t shared as(unused), tx_t tx as(unused)) {
         void* public_item = tm_start(shared);
         for(size_t i = 0; i < nb_items; i++){
             if(txn->writeset[i] == 1){
-                share->t_var[i].ts = txn->timestamps[i] +1;
+                atomic_store_explicit(&share->t_var[i].ts, txn->timestamps[i] +1, memory_order_release);
                 memcpy(public_item, &txn->local_copy[i*align], align);
                 public_item = (char *) public_item + align;
                 //free(txn->local_copy[i]); // free each piece of local_copy HERE check whether * needed or should "typecast"
@@ -479,6 +490,7 @@ bool tm_write(shared_t shared as(unused), tx_t tx as(unused), void const* source
     for(size_t i = mem_index; i < (nb_items + mem_index); i++){
         if(txn->writeset[i]==0){ // item not in tx write_set
             if(lock_acquire(&share->t_var[i].mutex)){ // here added & or error
+                atomic_
                 txn->writeset[i] = 1;
                 //txn->initial_ts[i] = (int) share->t_var[i].ts;
                 // store in tx->initial_vals[i] only that specific fragment of memory 
