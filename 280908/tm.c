@@ -25,6 +25,7 @@
 #include <stdatomic.h>
 #include <stddef.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 // Internal headers
 #include <tm.h>
@@ -107,7 +108,7 @@ size_t get_index(shared_t shared, void const* source as(unused)){
 }
 
 typedef struct{
-    unsigned int ts;
+    int ts; // unsigned
     pthread_mutex_t mutex;
     bool lock_flag;
 }t_variables;
@@ -117,8 +118,8 @@ typedef struct{
     int * readset; // array of integers   // perhaps pointer to pointers of ints
     int * writeset; // array of integers
     char * local_copy; // array of memory pieces
-    void * initial_ts;
-    void * timestamps;
+    int * initial_ts;
+    int * timestamps;
 }transaction;
 
 struct region {
@@ -222,6 +223,66 @@ size_t tm_nb_itemz(shared_t shared as(unused)) {
  * @param is_ro  Whether the transaction is read-only
  * @return Opaque transaction ID, 'invalid_tx' on failure
 **/
+
+bool tm_validate(shared_t shared as(unused), tx_t tx as(unused)){
+    // get nb_items
+	struct region * share = (struct region *) shared;
+    transaction * txn = (transaction *) tx;
+    size_t size = tm_size(shared);
+    size_t align = tm_align(shared);
+    size_t nb_items = size/align;
+    // iterate readset
+    for(size_t i = 0; i < nb_items; i++){
+        if(txn->readset[i]==1){
+            if(txn->readonly){
+                if(share->t_var[i].ts != txn->timestamps[i]){ // careful, comparing signed and unsigned int
+                    return false; // validation failed
+                }
+            }
+            else if((share->t_var[i].lock_flag == true && txn->writeset[i]==0)){ // if locked and not in this tx wset
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+
+bool tm_abort(shared_t shared as(unused), tx_t tx as(unused)){ // the grading tool will not call tm_end if tx aborts, hence either I call it or tm_abort takes care of the rollback & memory freeing.
+	transaction * txn = (transaction *) tx;
+	struct region * share = (struct region *) shared;
+    if(!txn->readonly){ // if tx performed both w & r
+        size_t nb_items = tm_nb_itemz(shared);
+        void* public_item = tm_start(shared);
+        for(size_t i = 0; i < nb_items; i++){
+            if(txn->writeset[i]==1){ // NO need to rollback values and initial timestamps because they were never written
+                free(txn->local_copy[i]);
+                // release locks
+                lock_release(&share->t_var[i].mutex);
+                share->t_var[i].lock_flag = false;
+                // restore previous version memcpy(this_align, target in shared, size) HERE
+            }
+        }
+        // free
+        // free all W arrays
+        free(txn->writeset);
+        free(txn->readset);
+        free(txn->timestamps);
+        free(txn->initial_ts);
+        // free initial_vals HERE
+        free(txn->local_copy);
+        free(txn); // HERE are you freeing the actual TX or a copy?
+    }
+    else{ // "rollback" for read
+        // free all R arrays
+        free(txn->readset);
+        free(txn->timestamps);
+        // free transaction
+        free(txn);
+    }
+    return true; // HERE
+}
+
 tx_t tm_begin(shared_t shared as(unused), bool is_ro as(unused)) {
 // try to fix request for member in something not a structure or union
 	struct region * share = (struct region *) shared;
@@ -232,7 +293,7 @@ tx_t tm_begin(shared_t shared as(unused), bool is_ro as(unused)) {
     tx->readonly = is_ro;
     size_t size = tm_size(shared);
     size_t align = tm_align(shared);
-    size_t nb_items = get_nb_items(size, align);
+    size_t nb_items = tm_nb_itemz(shared);
     //size_t nb_items = get_nb_items(size, align);
     
     if(is_ro){
@@ -259,7 +320,7 @@ tx_t tm_begin(shared_t shared as(unused), bool is_ro as(unused)) {
         init_ts = (int *) malloc(nb_items * sizeof(int));
         
         // init array -> x nb_items HERE
-        char * init_v = (char*) calloc(nb_items, sizeof(char));
+        char * init_v = (char*) calloc(nb_items, sizeof(char)); // how to allocate for "align"-piece of memory X nb_items
         //(t_variables *) calloc(nb_items, sizeof(t_variables));
         //tx.local_copy = NULL; // 
         
@@ -292,6 +353,7 @@ tx_t tm_begin(shared_t shared as(unused), bool is_ro as(unused)) {
  * @return Whether the whole transaction committed
 **/
 bool tm_end(shared_t shared as(unused), tx_t tx as(unused)) {
+	struct region * share = (struct region *) shared;
 	transaction * txn = (transaction *) tx;
     // replace with shared->nb_itemz HERE
     //size_t size = tm_size(shared);
@@ -308,97 +370,38 @@ bool tm_end(shared_t shared as(unused), tx_t tx as(unused)) {
         free(txn);
     }
     else{ // HERE
-        
-        if(!tm_validate(shared, tx)){ 
-            tm_abort();
+        bool res = tm_validate(shared, tx);
+        if(!res){
+            tm_abort(shared, tx);
             return false; 
         }
-        void* public_item = tm_start(shared);
+        void* public_item = &tm_start(shared);
         for(size_t i = 0; i < nb_items; i++){
-            if(txn->writeset[i]) == 1){
-                shared->t_var[i].ts = tx->timestamps[i] +1;
-                memcpy(public_item, tx->local_copy[i], align);
+            if(txn->writeset[i] == 1){
+                share->t_var[i].ts = txn->timestamps[i] +1;
+                memcpy(public_item, txn->local_copy[i], align);
                 public_item = (char *) public_item + align;
-                free(tx->local_copy[i]); // free each piece of local_copy HERE check whether * needed or should "typecast"
-                lock_release(shared->t_var[i].mutex);
-                shared->t_var[i].lock_flag = false;
+                free(txn->local_copy[i]); // free each piece of local_copy HERE check whether * needed or should "typecast"
+                lock_release(&share->t_var[i].mutex); // here error before putting &
+                share->t_var[i].lock_flag = false;
             }
         }
         // free all W arrays
-        free(tx->writeset);
-        free(tx->readset);
-        free(tx->timestamps);
-        free(tx->initial_ts);
+        free(txn->writeset);
+        free(txn->readset);
+        free(txn->timestamps);
+        free(txn->initial_ts);
         // free initial_vals HERE
-        free(tx);
+        free(txn);
     }
     return true;
 }
 
-/** [thread-safe] Read operation in the given transaction, source in the shared region and target in a private region.
- * @param shared Shared memory region associated with the transaction
- * @param tx     Transaction to use
- * @param source Source start address (in the shared region)
- * @param size   Length to copy (in bytes), must be a positive multiple of the alignment
- * @param target Target start address (in a private region)
- * @return Whether the whole transaction can continue
-**/
 
-bool tm_validate(shared_t shared as(unused), tx_t tx as(unused)){
-    // get nb_items
-    size_t size = tm_size(shared);
-    size_t align = tm_align(shared);
-    size_t nb_items = size/align;
-    // iterate readset
-    for(size_t i = 0; i < nb_items; i++){
-        if(tx->readset[i]==1){
-            if(tx->readonly){
-                if(shared->t_var[i].ts != tx->timestamps[i]){
-                    return false; // validation failed
-                }
-            }
-            else if((shared->t_var[i].lock_flag == true && tx->writeset[i]==0)){ // if locked and not in this tx wset
-                return false;
-            }
-        }
-    }
-    return true;
-}
-
-bool tm_abort(shared_t shared as(unused), tx_t tx as(unused)){ // the grading tool will not call tm_end if tx aborts, hence either I call it or tm_abort takes care of the rollback & memory freeing.
-    if(!tx->readonly){ // if tx performed both w & r
-        size_t nb_items = shared->nb_itemz;
-        void* public_item = tm_start(shared);
-        for(size_t i = 0; i < nb_items; i++){
-            if(tx->writeset[i]==1){ // NO need to rollback values and initial timestamps because they were never written
-                free(tx->local_copy[i]);
-                // release locks
-                lock_release(shared->t_var[i].mutex);
-                shared->t_var[i].lock_flag = false;
-                // restore previous version memcpy(this_align, target in shared, size) HERE
-            }
-        }
-        // free
-        // free all W arrays
-        free(tx->writeset);
-        free(tx->readset);
-        free(tx->timestamps);
-        free(tx->initial_ts);
-        // free initial_vals HERE
-        free(tx->local_copy);
-        free(tx);
-    }
-    else{ // "rollback" for read
-        // free all R arrays
-        free(tx->readset);
-        free(tx->timestamps);
-        // free transaction
-        free(tx);
-    }
-    return true; // HERE
-}
 
 bool tm_read(shared_t shared as(unused), tx_t tx as(unused), void const* source as(unused), size_t size as(unused), void* target as(unused)) {
+	struct region * share = (struct region *) shared;
+	transaction * txn = (transaction *) tx;
     // check size validity
     size_t align = tm_align(shared);
     if(size % align != 0){
@@ -408,10 +411,10 @@ bool tm_read(shared_t shared as(unused), tx_t tx as(unused), void const* source 
     size_t nb_items = get_nb_items(size, align);
     
     // first if m belongs to wset
-    if(!tx->readonly){ // add if ! tm_validate() -> abort HERE
+    if(!txn->readonly){ // add if ! tm_validate() -> abort HERE
         for(size_t i = mem_index; i < (nb_items + mem_index); i++){
-            if(tx->writeset[i]==0){ // item not in tx write_set
-                if(shared->t_var[i].lock_flag == true){
+            if(txn->writeset[i]==0){ // item not in tx write_set
+                if(share->t_var[i].lock_flag == true){
                     // call tm_abort
                     return false;
                 }// why break here?
@@ -422,14 +425,15 @@ bool tm_read(shared_t shared as(unused), tx_t tx as(unused), void const* source 
                 return true;
             }
     }
-        if(!tm_validate()){ // HERE
-            tm_abort(); 
+	bool res = tm_validate(shared, tx);
+        if(!res){ // HERE
+            tm_abort(shared, tx); 
             return false;
         }
     for(size_t i = mem_index; i < (nb_items + mem_index); i++){
-        if(tx->readset[i]==0){ // item not in tx read_set yet
-            tx->readset[i] = 1;
-            tx->timestamps[i] = (int) shared->t_var[i].ts; // too much granularity in the timestamps, probably this will cause problems
+        if(txn->readset[i]==0){ // item not in tx read_set yet // here correct finding the highest timestamp instead and updating it for every piece of memory?
+            txn->readset[i] = 1;
+            txn->timestamps[i] = (int) share->t_var[i].ts; // too much granularity in the timestamps, probably this will cause problems
         }
     }
     memcpy(target, source, size); // HERE
@@ -447,6 +451,8 @@ bool tm_read(shared_t shared as(unused), tx_t tx as(unused), void const* source 
  * @return Whether the whole transaction can continue
 **/
 bool tm_write(shared_t shared as(unused), tx_t tx as(unused), void const* source as(unused), size_t size as(unused), void* target as(unused)) {
+	struct region * share = (struct region *) shared;
+	transaction * txn = (transaction *) tx;
     size_t align = tm_align(shared);
     if(size % align != 0){
         return false;
@@ -455,10 +461,10 @@ bool tm_write(shared_t shared as(unused), tx_t tx as(unused), void const* source
     size_t nb_items = get_nb_items(size, align);
     
     for(size_t i = mem_index; i < (nb_items + mem_index); i++){
-        if(tx->writeset[i]==0){ // item not in tx write_set
-            if(lock_acquire(shared->t_var[i].mutex)){
-                tx->writeset[i] = 1;
-                tx->initial_ts[i] = (int) shared->t_var[i].ts;
+        if(txn->writeset[i]==0){ // item not in tx write_set
+            if(lock_acquire(&share->t_var[i].mutex)){ // here added & or error
+                txn->writeset[i] = 1;
+                txn->initial_ts[i] = (int) share->t_var[i].ts;
                 // store in tx->initial_vals[i] only that specific fragment of memory 
             }
             else{
