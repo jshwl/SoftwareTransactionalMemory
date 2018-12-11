@@ -238,9 +238,11 @@ bool tm_validate(shared_t shared as(unused), tx_t tx as(unused)){
             if(share->t_var[i].ts != txn->timestamps[i]){ // careful, comparing atomic_uint and int
                 return false; // validation failed
             }// atomic_thread_fence(memory_order_acquire)
-            atomic_thread_fence(memory_order_release);
-            if(share->t_var[i].lock_flag == true && txn->writeset[i]==0){ // if locked and not in this tx wset
-                return false;
+            atomic_thread_fence(memory_order_release); // verify that writeset[i] != NULL
+            if(txn->writeset[i] != NULL){
+                if(share->t_var[i].lock_flag == true && txn->writeset[i]==0){ // if locked and not in this tx wset
+                    return false;
+                }
             }
         }
     }
@@ -255,10 +257,12 @@ bool tm_abort(shared_t shared as(unused), tx_t tx as(unused)){ // the grading to
         size_t nb_items = tm_nb_itemz(shared);
         void* public_item = tm_start(shared);
         for(size_t i = 0; i < nb_items; i++){
-            if(txn->writeset[i]==1){ // NO need to rollback values and initial timestamps because they were never written
-                lock_release(&share->t_var[i].mutex);
-                share->t_var[i].lock_flag = false;
-                // do I need an atomic operation and specify memory_order_release?
+            if(txn->writeset[i] != NULL){
+                if(txn->writeset[i]==1){ // NO need to rollback values and initial timestamps because they were never written
+                    lock_release(&share->t_var[i].mutex);
+                    share->t_var[i].lock_flag = false;
+                    // do I need an atomic operation and specify memory_order_release?
+                }
             }
         }
         free(txn->writeset);
@@ -444,14 +448,16 @@ bool tm_write(shared_t shared as(unused), tx_t tx as(unused), void const* source
     size_t nb_items = get_nb_items(size, align);
     
     for(size_t i = mem_index; i < (nb_items + mem_index); i++){
-        if(txn->writeset[i]==0){ // item not in tx write_set
-            if(lock_acquire(&share->t_var[i].mutex)){ // try to add it, plus get the timestamp in an atomic way
-                txn->timestamps[i] = atomic_load_explicit(&share->t_var[i].ts, memory_order_acquire);
-                txn->writeset[i] = 1;
-            }
-            else{
-                tm_abort(shared, tx); // HERE
-                return false;
+        if(txn->writeset[i] != NULL){
+            if(txn->writeset[i]==0){ // item not in tx write_set
+                if(lock_acquire(&share->t_var[i].mutex)){ // try to add it, plus get the timestamp in an atomic way
+                    txn->timestamps[i] = atomic_load_explicit(&share->t_var[i].ts, memory_order_acquire);
+                    txn->writeset[i] = 1;
+                }
+                else{
+                    tm_abort(shared, tx); // HERE
+                    return false;
+                }
             }
         }
     }
