@@ -145,7 +145,7 @@ shared_t tm_create(size_t size as(unused), size_t align as(unused)) {
         return invalid_shared;
     }
     size_t align_alloc = align < sizeof(void*) ? sizeof(void*) : align;
-    // Allocate first segment of the region
+    // Allocate first segment of the region // QUESTION HERE
     if (unlikely(posix_memalign(&(region->start), align_alloc, size) != 0)) {
         free(region);
         return invalid_shared;
@@ -160,7 +160,7 @@ shared_t tm_create(size_t size as(unused), size_t align as(unused)) {
     region->align_alloc = align_alloc;
     size_t nb_items = size / align;
     region->nb_itemz = nb_items;
-    // check here
+    
     t_variables * t_vars = (t_variables *) calloc(nb_items, sizeof(t_variables));
     if (unlikely(!t_vars)) {
         free(region);
@@ -169,8 +169,7 @@ shared_t tm_create(size_t size as(unused), size_t align as(unused)) {
     // initialize all the locks
     for(size_t i = 0; i < nb_items; i++){
         lock_init(&t_vars[i].mutex);
-        t_vars[i].lock_flag = false; // before it was region->t_var[i]...
-        //t_vars[i].ts = 0u; // can I do
+        t_vars[i].lock_flag = false; 
         atomic_init(&t_vars[i].ts,0u);
     }
 	region->t_var = t_vars;
@@ -226,7 +225,7 @@ size_t tm_nb_itemz(shared_t shared as(unused)) {
 **/
 
 bool tm_validate(shared_t shared as(unused), tx_t tx as(unused)){
-    // get nb_items
+    // txn->readonly shouldn't get here
 	struct region * share = (struct region *) shared;
     transaction * txn = (transaction *) tx;
     size_t size = tm_size(shared);
@@ -234,13 +233,13 @@ bool tm_validate(shared_t shared as(unused), tx_t tx as(unused)){
     size_t nb_items = size/align;
     // iterate readset
     for(size_t i = 0; i < nb_items; i++){
-        if(txn->readset[i]==1){
-            if(txn->readonly){
-                if(share->t_var[i].ts != txn->timestamps[i]){ // careful, comparing signed and unsigned int
-                    return false; // validation failed
-                }
-            }
-            else if((share->t_var[i].lock_flag == true && txn->writeset[i]==0)){ // if locked and not in this tx wset
+        if(txn->readset[i]==1){ // this part requires an atomic order_acquire
+            atomic_thread_fence(memory_order_acquire);
+            if(share->t_var[i].ts != txn->timestamps[i]){ // careful, comparing atomic_uint and int
+                return false; // validation failed
+            }// atomic_thread_fence(memory_order_acquire)
+            atomic_thread_fence(memory_order_release);
+            if(share->t_var[i].lock_flag == true && txn->writeset[i]==0){ // if locked and not in this tx wset
                 return false;
             }
         }
@@ -257,31 +256,21 @@ bool tm_abort(shared_t shared as(unused), tx_t tx as(unused)){ // the grading to
         void* public_item = tm_start(shared);
         for(size_t i = 0; i < nb_items; i++){
             if(txn->writeset[i]==1){ // NO need to rollback values and initial timestamps because they were never written
-                //free(txn->local_copy[i]);
-                // release locks
                 lock_release(&share->t_var[i].mutex);
                 share->t_var[i].lock_flag = false;
-                // restore previous version memcpy(this_align, target in shared, size) HERE
+                // do I need an atomic operation and specify memory_order_release?
             }
         }
-        // free
-        // free all W arrays
         free(txn->writeset);
         free(txn->readset);
         free(txn->timestamps);
-        //free(txn->initial_ts);
-        // free initial_vals HERE
         free(txn->local_copy);
-        free(txn); // HERE are you freeing the actual TX or a copy?
-    }
-    else{ // "rollback" for read
-        // free all R arrays
-        free(txn->readset);
-        free(txn->timestamps);
-        // free transaction
         free(txn);
     }
-    return true; // HERE
+    else{
+        free(txn);
+    }
+    return true;
 }
 
 tx_t tm_begin(shared_t shared as(unused), bool is_ro as(unused)) {
@@ -298,24 +287,7 @@ tx_t tm_begin(shared_t shared as(unused), bool is_ro as(unused)) {
     tx->readonly = is_ro;
     
     if(is_ro){ // try to return immediately when this calls read -> so just return true and in tm_read if(txn->readonly) memcpy()...
-        int * rset = NULL;
-        rset = (int *) malloc(nb_items * sizeof(int));
-		if (unlikely(!rset)) {
-			return invalid_tx;
-		}
-		
-        int * timest = NULL;
-        timest = (int *) malloc(nb_items * sizeof(int));
-        if (unlikely(!timest)) {
-        	return invalid_tx;
-   		}
-   		
-        for(size_t i = 0; i< nb_items; i++){
-            rset[i] = 0;
-            timest[i] = 0;
-        }
-        tx->readset = rset;
-        tx->timestamps = timest;
+        return tx;
     }
     else{
         int * wset = NULL;
@@ -342,7 +314,6 @@ tx_t tm_begin(shared_t shared as(unused), bool is_ro as(unused)) {
         	return invalid_tx;
    		}
    		
-   		
         char * init_v = (char*) calloc(nb_items, sizeof(align)); // 
         if (unlikely(!init_v)){
         	return invalid_tx;
@@ -350,17 +321,7 @@ tx_t tm_begin(shared_t shared as(unused), bool is_ro as(unused)) {
         
         void* source_item = tm_start(shared);
         for(size_t i = 0; i< nb_items; i++){
-            //atomic_init(timest[i],0u);
-        }
-        for(size_t i = 0; i< nb_items; i++){
-            if(!(share->t_var[i].lock_flag)){ // should it have [i*align too?]
-                timest[i] = atomic_load_explicit(&share->t_var[i].ts, memory_order_acquire);
-                memcpy(init_v[i*align], source_item, align); // because otherwise 1-elem at a time
-            }
-            else{
-                timest[i] = atomic_load_explicit(&share->t_var[i].ts, memory_order_acquire);
-                init_v[i] = NULL;
-            }
+            timest[i] = atomic_load_explicit(&share->t_var[i].ts, memory_order_acquire); // perhaps no need at this point, can be done at tm_write time
             wset[i] = 0;
             rset[i] = 0;
             source_item = (char*) source_item + align;
@@ -368,7 +329,7 @@ tx_t tm_begin(shared_t shared as(unused), bool is_ro as(unused)) {
         tx->writeset    = wset;
         tx->readset     = rset;
         tx->timestamps  = timest;
-        tx->local_copy  = init_v;
+        tx->local_copy  = init_v; // not initialized, could set all entries to null
     }
     return tx;
 }
@@ -387,12 +348,6 @@ bool tm_end(shared_t shared as(unused), tx_t tx as(unused)) {
     size_t nb_items = tm_nb_itemz(shared);
     
     if(txn->readonly){
-        // free all R arrays
-        //free(((transaction*)tx)->readset);
-		free(txn->readset);
-        //free(((transaction*)tx)->timestamps);
-		free(txn->timestamps);
-        // free transaction
         free(txn);
     }
     else{ // HERE
@@ -402,23 +357,20 @@ bool tm_end(shared_t shared as(unused), tx_t tx as(unused)) {
             return false; 
         }
         void* public_item = tm_start(shared);
-        for(size_t i = 0; i < nb_items; i++){
+        for(size_t i = 0; i < nb_items; i++){ // copy piece by piece in shared memory + update the timestamp atomically
             if(txn->writeset[i] == 1){
-                atomic_store_explicit(&share->t_var[i].ts, txn->timestamps[i] +1, memory_order_release);
+                //atomic_fetch_add_explicit(&share->t_var[i].ts,1, memory_order_release);
+                atomic_store_explicit(&share->t_var[i].ts, txn->timestamps[i] +1, memory_order_release); // better way to do t_var[i].ts = atomic_F&A(txn->timestamps[i])?
                 memcpy(public_item, &txn->local_copy[i*align], align);
                 public_item = (char *) public_item + align;
-                //free(txn->local_copy[i]); // free each piece of local_copy HERE check whether * needed or should "typecast"
-                lock_release(&share->t_var[i].mutex); // here error before putting &
+                lock_release(&share->t_var[i].mutex);
                 share->t_var[i].lock_flag = false;
             }
         }
 		free(txn->local_copy);
-        // free all W arrays
         free(txn->writeset);
         free(txn->readset);
         free(txn->timestamps);
-        //free(txn->initial_ts);
-        // free initial_vals HERE
         free(txn);
     }
     return true;
@@ -434,37 +386,43 @@ bool tm_read(shared_t shared as(unused), tx_t tx as(unused), void const* source 
     if(size % align != 0){
         return false;
     }
+    if(txn->readonly){
+        memcpy(target, source, size); // under assumption from TA
+        return true;
+    }
     size_t mem_index = get_index(shared, source);
     size_t nb_items = get_nb_items(size, align);
     
     // first if m belongs to wset
-    if(!txn->readonly){ // add if ! tm_validate() -> abort HERE
-        for(size_t i = mem_index; i < (nb_items + mem_index); i++){
-            if(txn->writeset[i]==0){ // item not in tx write_set
-                if(share->t_var[i].lock_flag == true){
-                    // call tm_abort
-                    return false;
-                }// why break here?
-                break;
+
+    for(size_t i = mem_index; i < (nb_items + mem_index); i++){  // reading from where the process asks
+        if(txn->writeset[i]==0){ // item not in tx write_set
+            if(share->t_var[i].lock_flag == true){
+               tm_abort(share, txn);
+               return false;
             }
-            if(i == (nb_items + mem_index - 1)){
-                memcpy(target, source, size); // HERE at the end
-                return true;
-            }
-    }
-	bool res = tm_validate(shared, tx);
-        if(!res){ // HERE
-            tm_abort(shared, tx); 
-            return false;
+            break;
         }
+        if(i == (nb_items + mem_index - 1)){ // finished loop without encountering a non-wset element-> hence can read immediately -> wrong! I must read my own local_copy with the updates!
+            //memcpy(target, source, size); // if you have previously modified them then there's no need to "re-read" AKA copy them on themselves
+            return true;
+        }
+    }
+	bool res = tm_validate(share, txn);
+    if(!res){ // HERE
+        tm_abort(share, txn); 
+        return false;
+    }
     for(size_t i = mem_index; i < (nb_items + mem_index); i++){
         if(txn->readset[i]==0){ // item not in tx read_set yet // here correct finding the highest timestamp instead and updating it for every piece of memory?
             txn->readset[i] = 1;
-            txn->timestamps[i] = (int) share->t_var[i].ts; // too much granularity in the timestamps, probably this will cause problems
+            txn->timestamps[i] = atomic_load_explicit(&share->t_var[i].ts, memory_order_acquire);
+            //txn->timestamps[i] = (int) share->t_var[i].ts; // too much granularity in the timestamps, probably this will cause problems
         }
     }
-    memcpy(target, source, size); // HERE
-        return true;
+    memcpy(target, source, size); // or in local copy?
+    memcpy(&txn->local_copy[mem_index*align], source, size); // try both HERE * ALIGN or NOT
+    return true;
     }
     
 }
@@ -489,11 +447,9 @@ bool tm_write(shared_t shared as(unused), tx_t tx as(unused), void const* source
     
     for(size_t i = mem_index; i < (nb_items + mem_index); i++){
         if(txn->writeset[i]==0){ // item not in tx write_set
-            if(lock_acquire(&share->t_var[i].mutex)){ // here added & or error
-                atomic_
+            if(lock_acquire(&share->t_var[i].mutex)){ // try to add it, plus get the timestamp in an atomic way
+                txn->timestamps[i] = atomic_load_explicit(&share->t_var[i].ts, memory_order_acquire);
                 txn->writeset[i] = 1;
-                //txn->initial_ts[i] = (int) share->t_var[i].ts;
-                // store in tx->initial_vals[i] only that specific fragment of memory 
             }
             else{
                 tm_abort(shared, tx); // HERE
@@ -502,7 +458,7 @@ bool tm_write(shared_t shared as(unused), tx_t tx as(unused), void const* source
         }
     }
     // perhaps need to update the ts for all to the highest found during the iterations
-    memcpy(target, source, size);
+    memcpy(&txn->local_copy[mem_index*align], source, size);
     return true;
 }
 
