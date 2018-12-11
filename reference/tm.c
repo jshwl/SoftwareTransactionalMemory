@@ -180,7 +180,6 @@ static bool lock_acquire(struct lock_t* lock) {
 
 /** Release the given lock.
  * @param lock Lock to release
- this will also need to set the mem_unit->lock_flag to false
 **/
 static void lock_release(struct lock_t* lock) {
     pthread_mutex_unlock(&(lock->mutex));
@@ -355,7 +354,7 @@ static const tx_t read_only_tx  = UINTPTR_MAX - 10;
 static const tx_t read_write_tx = UINTPTR_MAX - 11;
 
 struct region {
-    struct lock_t lock; // Global lock+d
+    struct lock_t lock; // Global lock
     void* start;        // Start of the shared memory region
     struct link allocs; // Allocated shared memory regions
     size_t size;        // Size of the shared memory region (in bytes)

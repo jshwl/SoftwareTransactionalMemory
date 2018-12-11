@@ -423,8 +423,6 @@ bool tm_read(shared_t shared as(unused), tx_t tx as(unused), void const* source 
     memcpy(target, source, size); // or in local copy?
     memcpy(&txn->local_copy[mem_index*align], source, size); // try both HERE * ALIGN or NOT
     return true;
-    }
-    
 }
 
 /** [thread-safe] Write operation in the given transaction, source in a private region and target in the shared region.
