@@ -85,9 +85,11 @@ static bool lock_init(pthread_mutex_t * lock) {
     return pthread_mutex_init((lock), NULL) == 0;
 }
 
+/*
 static void lock_cleanup(pthread_mutex_t * lock) {
     pthread_mutex_destroy(lock);
 }
+*/
 // exclusive lock access
 static bool lock_acquire(pthread_mutex_t* lock) {
     return pthread_mutex_trylock(lock) == 0;
@@ -108,13 +110,11 @@ size_t get_nb_items(size_t size, size_t align){
     return (size_t)size/align;
 }
 
-// get t_var index HERE after testing rewrite in simple way 
+// 
 size_t get_index(shared_t shared, void const* source as(unused)){
-    void const * src_addr = source;
-    void * start = tm_start(shared);
     size_t align = tm_align(shared);
-    size_t diff = source -start;
-    size_t index = diff/align;
+    void * start = tm_start(shared);
+    size_t index = (source - start) / align;
     return index;
 }
 
@@ -132,6 +132,15 @@ void setFalse(bool * flag){
 }
 void setTrue(bool * flag){
     *flag = true;
+    return;
+}
+
+void setTS(int * ts, int sharedTS){
+    *ts = sharedTS;
+    return;
+}
+void setTSg2l(int * localTS, atomic_uint ts){
+    *localTS = (int) ts;
     return;
 }
 
@@ -156,7 +165,6 @@ struct region {
     size_t size;        // Size of the shared memory region (in bytes)
     size_t align;       // Claimed alignment of the shared memory region (in bytes)
     size_t align_alloc; // Actual alignment of the memory allocations (in bytes)
-    size_t nb_itemz; // nb of items for easier retrieval
     t_variables * t_var;
 };
 
@@ -184,13 +192,12 @@ shared_t tm_create(size_t size as(unused), size_t align as(unused)) {
     memset(region->start, 0, size);
    
     //
-    //printf("tm_create \t start \t %p \n", region->start);
+    //printf("---------------tm_create \t start \t %p --------------\n", region->start);
     // initialize region elements
     region->size        = size;
     region->align       = align;
     region->align_alloc = align_alloc;
     size_t nb_items = size / align;
-    region->nb_itemz = nb_items;
     
     t_variables * t_vars = (t_variables *) calloc(nb_items, sizeof(t_variables));
     if (unlikely(!t_vars)) {
@@ -204,6 +211,7 @@ shared_t tm_create(size_t size as(unused), size_t align as(unused)) {
         atomic_init(&t_vars[i].ts,0u);
     }
 	region->t_var = t_vars;
+	printf("-------------------- created region + items = %lu ------------------\n", nb_items);
     return region;
     
 }
@@ -212,42 +220,24 @@ shared_t tm_create(size_t size as(unused), size_t align as(unused)) {
  * @param shared Shared memory region to destroy, with no running transaction
 **/
 void tm_destroy(shared_t shared as(unused)) {
+    printf("Destroy called\n");
     struct region* region = (struct region*) shared;
-    // should check that all locks are free, i.e. no write transaction ongoing 
-    
-    // and remove all subsequent links + free the memory
     free(region->t_var);
     free(region->start);
     free(region);
 }
 
-/** [thread-safe] Return the start address of the first allocated segment in the shared memory region. something
- * @param shared Shared memory region to query
- * @return Start address of the first allocated segment
-**/
 void* tm_start(shared_t shared as(unused)) {
     void * star = ((struct region *)shared)->start;
     return star;
 }
 
-/** [thread-safe] Return the size (in bytes) of the first allocated segment of the shared memory region.
- * @param shared Shared memory region to query
- * @return First allocated segment size
-**/
 size_t tm_size(shared_t shared as(unused)) {
     return ((struct region*) shared)->size; 
 }
 
-/** [thread-safe] Return the alignment (in bytes) of the memory accesses on the given shared memory region.
- * @param shared Shared memory region to query
- * @return Alignment used globally
-**/
 size_t tm_align(shared_t shared as(unused)) {
     return ((struct region*) shared)->align; ;
-}
-
-size_t tm_nb_itemz(shared_t shared as(unused)) {
-    return ((struct region*) shared)->nb_itemz; 
 }
 
 /** [thread-safe] Begin a new transaction on the given shared memory region.
@@ -262,31 +252,44 @@ bool tm_validate(shared_t shared as(unused), tx_t tx as(unused)){
     transaction * txn = (transaction *) tx;
     size_t size = tm_size(shared);
     size_t align = tm_align(shared);
-    size_t nb_items = size/align;
+	size_t nb_items = size / align;
     // iterate readset
     for(size_t i = 0; i < nb_items; i++){
         if(txn->readset[i]==1){ // this part requires an atomic order_acquire
-            atomic_thread_fence(memory_order_acquire);
-            if(share->t_var[i].ts != txn->timestamps[i]){ // careful, comparing atomic_uint and int
-                return false; // validation failed
-            }// atomic_thread_fence(memory_order_acquire)
-            atomic_thread_fence(memory_order_release); // verify that writeset[i] != NULL
-            if(share->t_var[i].lock_flag == true && txn->writeset[i]==0){ // if locked and not in this tx wset
-                return false;
+            if(txn->readonly){
+                if((int)share->t_var[i].ts != txn->timestamps[i] || share->t_var[i].lock_flag == true){
+                    //printf("share ts= %lu\tlocal ts= %d\tlocked?%s", share->t_var[i].ts, txn->timestamps[i],share->t_var[i].lock_flag?"true":"false");
+                    return false;
+                }
+            }
+            else{
+                //atomic_thread_fence(memory_order_acquire);
+                if((int)share->t_var[i].ts != txn->timestamps[i]){ // careful, comparing atomic_uint and int
+                    //printf("validation failed %lu\n", i);
+                    return false; // validation failed
+                }// atomic_thread_fence(memory_order_acquire)
+                //atomic_thread_fence(memory_order_release); // verify that writeset[i] != NULL
+                if(share->t_var[i].lock_flag == true && txn->writeset[i]==0){ // if locked and not in this tx wset
+                    return false;
+                }
             }
         }
     }
+    //printf("validated!\n");
     return true;
 }
 
 
-bool tm_abort(shared_t shared as(unused), tx_t tx as(unused)){ // the grading tool will not call tm_end if tx aborts, hence either I call it or tm_abort takes care of the rollback & memory freeing.
-	//printf("<tm_abort> begin\n");
+bool tm_abort(shared_t shared as(unused), tx_t tx as(unused)){ 
 	transaction * txn = (transaction *) tx;
 	struct region * share = (struct region *) shared;
+	size_t size = tm_size(shared);
+    size_t align = tm_align(shared);
+	size_t nb_items = size / align;
+	//printf("RO aborting %lu\n", nb_items);
     if(!txn->readonly){ // if tx performed both w & r
-        //printf("<tm_abort> end not readonly\n");
-        size_t nb_items = tm_nb_itemz(shared);
+        //printf("<tm_abort> end WR\n");
+        
         for(size_t i = 0; i < nb_items; i++){
             if(txn->writeset[i]==1){ // NO NEED TO REWRITE, just free the memory txn->local_copy and release the lock HERE add Fence or atomic TestAndSet
                 lock_release(&share->t_var[i].mutex);
@@ -301,32 +304,45 @@ bool tm_abort(shared_t shared as(unused), tx_t tx as(unused)){ // the grading to
         free(txn);
     }
     else{
+        free(txn->readset);
+        free(txn->timestamps);
         free(txn);
     }
     return true;
 }
-
+// I'm intersted in the timestamps only when I start reading // otherwise things will always be different from the initial state and all txs will fail
 tx_t tm_begin(shared_t shared as(unused), bool is_ro as(unused)) {
-// try to fix "request for member in something not a structure or union"
-    //printf("<tm_BEGIN new tx started\n");
 	struct region * share = (struct region *) shared;
 	size_t size = tm_size(shared);
     size_t align = tm_align(shared);
-	size_t nb_items = tm_nb_itemz(share);
+	size_t nb_items = size / align;
     //transaction* tx = (transaction*) malloc(sizeof(transaction)); // careful, things could be in positions other than you think. + nb_items * sizeof(int));
 	transaction* tx = (transaction*) malloc(sizeof(transaction));
     if (unlikely(!tx)) {
         return invalid_tx;
     }
-    //printf("<tm_begin> tx readonly? %s\n", is_ro?"true":"false");
     tx->readonly = is_ro;
     
     if(is_ro){
-        //printf("<tm_begin> in is_ro \n");
+        
+        int * timest = NULL;
+        timest = (int *) malloc(nb_items * sizeof(int));
+        if (unlikely(!timest)) {
+        	return invalid_tx;
+   		}
+   		
+   		int * rset = NULL;
+   		rset = (int *) malloc(nb_items * sizeof(int));
+   		for(size_t i = 0; i< nb_items; i++){
+   		    rset[i] = 0;
+   		}
+   		tx->readset     = rset;
+        tx->timestamps  = timest;
+        // consider storing target addresses
         return tx;
     }
     else{
-        //printf("<tm_begin> in else \n");
+        //printf("<tm_begin> \tnew WR \n");
         int * wset = NULL;
         wset = (int *) malloc(nb_items * sizeof(int));
         if (unlikely(!wset)) {
@@ -357,12 +373,11 @@ tx_t tm_begin(shared_t shared as(unused), bool is_ro as(unused)) {
         	return invalid_tx;
     	}
         
-        void* source_item = tm_start(shared);
+        //void* source_item = tm_start(shared);
         for(size_t i = 0; i< nb_items; i++){
-            timest[i] = atomic_load_explicit(&share->t_var[i].ts, memory_order_acquire); // perhaps no need at this point, can be done at tm_write time
             wset[i] = 0;
             rset[i] = 0;
-            source_item = (char*) source_item + align;
+            //source_item = (char*) source_item + align;
             //printf("<tm_begin> init items %d \n", timest[i]);
         }
         tx->writeset    = wset;
@@ -384,105 +399,134 @@ bool tm_end(shared_t shared as(unused), tx_t tx as(unused)) {
 	struct region * share = (struct region *) shared;
 	transaction * txn = (transaction *) tx;
     // replace with shared->nb_itemz HERE
-    //size_t size = tm_size(shared);
+    size_t size = tm_size(shared);
     size_t align = tm_align(shared);
-    size_t nb_items = tm_nb_itemz(shared);
-    
+    size_t nb_items = size / align;
+    //printf("Ending trasaction %s\n", txn->readonly?"RO":"WR");
     if(txn->readonly){
-        printf("<tm_END> RO\n");
-        free(txn);
-        return true;
-    }
-    else{
-        //printf("<tm_END> before tm_validate\n");
-        bool res = tm_validate(shared, tx);
-        //printf("<tm_END> after tm_validate %s\n", res?"true":"false");
+        bool res = tm_validate(shared, tx);    
         if(!res){
             tm_abort(shared, tx);
             return false; 
         }
-        void* next_shared_address = tm_start(shared);
-        printf("<tm_END> WR trying \n");
+        else{
+            //printf("<tm_end> RO went through\n");
+            free(txn->readset);
+            free(txn->timestamps);
+            free(txn);
+            return true;
+        }
+    }
+    else{
+        bool res = tm_validate(shared, tx);
+        if(!res){
+            tm_abort(shared, tx);
+            return false; 
+        }
+        void* start = tm_start(shared);
+        //printf("<tm_END> WR trying \n");
         for(size_t i = 0; i < nb_items; i++){ // copy piece by piece in shared memory + update the timestamp atomically
-            printf("Writeset[%lu] = %d\n", i, txn->writeset[i]);
+            //printf("Writeset[%lu] = %d\n", i, txn->writeset[i]);
             if(txn->writeset[i] == 1){
-                //atomic_fetch_add_explicit(&share->t_var[i].ts,1, memory_order_release);
-                atomic_store_explicit(&share->t_var[i].ts, txn->timestamps[i] +1, memory_order_release); // better way to do t_var[i].ts = atomic_F&A(txn->timestamps[i])?
-                //printf("<tm_END> before memcpy\n");
+                void * next_shared_address = (align * i) + (char *) start;
+                //printf("PREaccount %lu = %d\n", i, next_shared_address);
+                //printf("AFT account %lu = %d\n", i, txn->local_copy[i*align]);
+                atomic_fetch_add(&share->t_var[i].ts,1);
                 memcpy(next_shared_address, &txn->local_copy[i*align], align);
-                //printf("<tm_END> after memcpy\n");
-                next_shared_address = (char *) next_shared_address + align;
-                int rest = lock_release(&share->t_var[i].mutex);
-                //printf("lock_release res =\t %s\n", res?"true":"false"); // works
-                //share->t_var[i].lock_flag = false;
-                setFalse(&share->t_var[i].lock_flag);
-                
             }
         }
+        for(size_t i = 0; i < nb_items; i++){ // copy piece by piece in shared memory + update the timestamp atomically
+            if(txn->writeset[i] == 1){
+                int res = lock_release(&share->t_var[i].mutex);
+                setFalse(&share->t_var[i].lock_flag);
+            }
+            //printf("shared_TS[%lu]\t = %u\n", i,share->t_var[i].ts);
+        }
+        
 		free(txn->local_copy);
         free(txn->writeset);
         free(txn->readset);
         free(txn->timestamps);
         free(txn);
-        printf("<tm_END> WR\n");
+        //printf("<tm_END> \tWR success\n");
         return true;
     }
 }
 
 
-
+// Whether the whole transaction can continue
 bool tm_read(shared_t shared as(unused), tx_t tx as(unused), void const* source as(unused), size_t size as(unused), void* target as(unused)) {
 	struct region * share = (struct region *) shared;
 	transaction * txn = (transaction *) tx;
-
+    size_t region_size = tm_size(share);
     size_t align = tm_align(shared);
+    size_t nb_items = region_size / align;
     if(size % align != 0){ // if assumption holds align should be == size for reads
+        tm_abort(share, txn);
         return false;
     }
-    
+
     size_t mem_index = get_index(share, source);
-    if(mem_index > size){ return false;}
-    if(txn->readonly){
-        ////printf("<tm_READ>  readonly before memcpy\n");
-        memcpy(target, source, size);
-        ////printf("<tm_READ>  readonly AFTER memcpy\n");
-        //////printf("Readonly\n");
-        return true;
+    //printf("try R [%lu] while lock == %d copy = %d\n", mem_index, share->t_var[mem_index].ts, txn->local_copy[mem_index*align]);
+    if(mem_index > nb_items){ 
+        //printf("index %lu > %lu region_size\n", mem_index, nb_items);
+        return false;
     }
-    if(size == align){
-        //printf("<tm_READ>  size=align\n");
-        if(txn->writeset[mem_index] ==1){
-            //printf("<tm_READ>  in writeset\n");
-            // return from updated local_copy
-            //printf("<tm_read> before \t %d - \n", txn->readset[mem_index]);
-            memcpy(target, &txn->local_copy[mem_index*align], align);
+    if(txn->readonly){
+        if(txn->readset[mem_index] == 0){
             setOne(&txn->readset[mem_index]);
-            //txn->readset[mem_index] = 1;
-            //printf("<tm_read> after \t %d =readset\n", txn->readset[mem_index]);
+            setTSg2l(&txn->timestamps[mem_index], share->t_var[mem_index].ts);
+            //printf("ts copy =%d - ts shared =%d\n", txn->timestamps[mem_index],share->t_var[mem_index].ts);
+            
+        }
+        if((!(share->t_var[mem_index].lock_flag)) && ((int) share->t_var[mem_index].ts == txn->timestamps[mem_index])){
+            memcpy(target, source, size);
             return true;
         }
         else{
+            tm_abort(shared,tx);
+            return false;
+        }
+    }
+    if(size == align){
+        if(txn->writeset[mem_index] ==1){
+            //printf("<tm_read> R local while wset[%lu] = %d\n", mem_index,txn->local_copy[mem_index*align]);
+            memcpy(target, &txn->local_copy[mem_index*align], align);
+            setOne(&txn->readset[mem_index]);
+            return true;
+        }
+        else if(txn->readset[mem_index] == 1){
+            if(txn->local_copy[mem_index*align] != 0){
+                memcpy(target, &txn->local_copy[mem_index*align], align);
+            }
+            else{
+                memcpy(target, source, align);
+            }
+            return true;
+        }
+        else{// new value to read
             memcpy(target, source, align);
             setOne(&txn->readset[mem_index]);
-            //txn->readset[mem_index] = 1;
             txn->timestamps[mem_index] = atomic_load_explicit(&share->t_var[mem_index].ts, memory_order_acquire);
             return true;
         }
     }
-    // this is going to be used if size > align and !txn->readonly
-    size_t nb_items = get_nb_items(size, align);
     
-    // first if m belongs to wset
-    //printf("<tm_read> SIZE > align \n");
-    for(size_t i = mem_index; i < (nb_items + mem_index); i++){  // reading from where the process asks
+    
+    
+   //printf("size>align & not readonly\n");
+    // this is going to be used if size > align and !txn->readonly
+    size_t items = get_nb_items(size, align);
+    
+    for(size_t i = mem_index; i < (items + mem_index); i++){  // reading from where the process asks
         if(txn->writeset[i]==0){ // item not in tx write_set
             if(share->t_var[i].lock_flag == true){
-               tm_abort(share, txn);
+               tm_abort(shared, tx);
                return false;
             }
             break;
         }
-        if(i == (nb_items + mem_index - 1)){ // finished loop without encountering a non-wset element-> hence can read immediately -> wrong! I must read my own local_copy with the updates!
+        if(i == (items + mem_index - 1)){ // finished loop without encountering a non-wset element-> hence can read immediately -> wrong! I must read my own local_copy with the updates!
             //memcpy(target, source, size); // if you have previously modified them then there's no need to "re-read" AKA copy them on themselves
             // wrong! just do memcpy()   // PAYLOAD INSTEAD OF ADDRESS!
             memcpy(target, &txn->local_copy[mem_index*align], size);
@@ -490,12 +534,12 @@ bool tm_read(shared_t shared as(unused), tx_t tx as(unused), void const* source 
             return true;
         }
     }
-	bool res = tm_validate(share, txn);
+	bool res = tm_validate(shared, tx);
     if(!res){ // HERE
-        tm_abort(share, txn); 
+        tm_abort(shared, tx); 
         return false;
     }
-    for(size_t i = mem_index; i < (nb_items + mem_index); i++){
+    for(size_t i = mem_index; i < (items + mem_index); i++){
         if(txn->readset[i]==0){ // item not in tx read_set yet // here correct finding the highest timestamp instead and updating it for every piece of memory?
             setOne(&txn->readset[i]);
             txn->readset[i] = 1;
@@ -519,55 +563,85 @@ bool tm_read(shared_t shared as(unused), tx_t tx as(unused), void const* source 
 bool tm_write(shared_t shared as(unused), tx_t tx as(unused), void const* source as(unused), size_t size as(unused), void* target as(unused)) { // target is what we need for--
 	struct region * share = (struct region *) shared;
 	transaction * txn = (transaction *) tx;
-    size_t align = tm_align(shared);
+	
+	if(txn->readonly){
+	    printf("weird\n");
+	    tm_abort(shared, tx);
+	    return false;
+	}
+	size_t region_size = tm_size(share);
+    size_t align = tm_align(share);
     if(size % align != 0){
+        tm_abort(shared, tx);
         return false;
     }
     ////printf("tm_write \t source %p \n", target);
-    size_t mem_index = get_index(share, target);
+    size_t mem_index = get_index(share, target); // you know where the target will go
     ////printf("tm_write \t index \t %lu\n", mem_index);
-    size_t nb_items = get_nb_items(size, align);
-    size_t all_items = tm_nb_itemz(share);
+    size_t items = get_nb_items(size, align);
+    size_t all_items = region_size / align;
     
-    if((mem_index + nb_items) > all_items){
-        tm_abort(shared, tx); // HERE
-        printf("get here too");
+    if((mem_index + items) > all_items){
+        //tm_abort(shared, tx); // HERE
+        printf("get here too\n");
         return false;
     }
     ////printf("tm_write \t nb_items \t %lu\n", nb_items);
-    
-    void* next_src_item = source;
-    //void* public_item = tm_start(shared);
-    printf("<tm_write> before loop  \t nb_items = %lu\t mem_index = %lu\t tot_aligns %lu\n", nb_items, mem_index, all_items);
-    for(size_t i = mem_index; i < (nb_items + mem_index); i++){ // HERE copy from "source"[i] to local_copy[i]
-            printf("<tm_write> \ttimes*align \t \n", txn->writeset[i*align]);
-            printf("<tm_write>  \tnormal \t\n", txn->writeset[i*align]);
-            if(((int)txn->writeset[i])==0){ // item not in tx write_set // set lock_flag = true; must be atomic
-                if(lock_acquire(&share->t_var[i].mutex)){ // try to add it, plus get the timestamp in an atomic way
-                    setTrue(&share->t_var[i].lock_flag);
-                    txn->timestamps[i] = atomic_load_explicit(&share->t_var[i].ts, memory_order_acquire);
-                    // ICI
-                    setOne(&txn->writeset[i]);
-                    //txn->writeset[i] = 1;
-                    printf("<tm_write> after increase writeset[] = %d\n", txn->writeset[i]);
-                    memcpy(&txn->local_copy[i*align], next_src_item, align);
-                    printf("tm_write next_src \t %p\n", (int) &txn->local_copy[i*align]);
-                }
-                else{
-                    tm_abort(shared, tx); // HERE
-                    return false;
-                }
+    if(items == 1){
+        if(((int)txn->writeset[mem_index])==1){
+            memcpy(&txn->local_copy[mem_index*align], source, align);
+            return true;
+        }
+        else{
+            if(lock_acquire(&share->t_var[mem_index].mutex)){
+                setTrue(&share->t_var[mem_index].lock_flag);
+                int sharedts = atomic_load_explicit(&share->t_var[mem_index].ts, memory_order_acquire);
+                //printf("SharedTS = %d\n", sharedts);
+                setTS(&txn->timestamps[mem_index], sharedts);
+                //printf("Mem_index = %lu \t TS = %d\n", mem_index,txn->timestamps[mem_index]);
+                setOne(&txn->writeset[mem_index]);
+                memcpy(&txn->local_copy[mem_index*align], source, align);
+                return true;
+                //printf("tm_write next_src \t %p\n", (int) &txn->local_copy[i*align]);
+            }else{
+                tm_abort(shared, tx);
+                return false;
             }
-            else if(((int)txn->writeset[i])==1){
-                printf("<tm_write> already in writeset \n");
-                memcpy(&txn->local_copy[i*align], next_src_item, align); // if TX already holds the lock then just write the small fragment in its local_copy
-                printf("<tm_write> in writeset memcopy successful \n");
-            }
-        //update next_item
-        next_src_item = (char *) next_src_item + align; // update position "+1"
+        }
     }
-    // perhaps need to update the ts for all to the highest found during the iterations
-    //memcpy(&txn->local_copy[mem_index*align], source, size); // need to be sure that local_copy in memory has distance from one item to the other == align
+    else{
+        printf("going here HERE\n");
+        void* next_src_item = source;
+        //void* public_item = tm_start(shared);
+        //printf("<tm_write> before loop  \t nb_items = %lu\t mem_index = %lu\t tot_aligns %lu\n", nb_items, mem_index, all_items);
+        for(size_t i = mem_index; i < (items + mem_index); i++){ // HERE copy from "source"[i] to local_copy[i]
+                //printf("<tm_write> \ttimes*align \t \n", txn->writeset[i*align]);
+                //printf("<tm_write>  \tnormal \t\n", txn->writeset[i*align]);
+                if(((int)txn->writeset[i])==0){ // item not in tx write_set // set lock_flag = true; must be atomic
+                    if(lock_acquire(&share->t_var[i].mutex)){ // try to add it, plus get the timestamp in an atomic way
+                        setTrue(&share->t_var[i].lock_flag);
+                        txn->timestamps[i] = atomic_load_explicit(&share->t_var[i].ts, memory_order_acquire);
+                        // ICI
+                        setOne(&txn->writeset[i]);
+                        memcpy(&txn->local_copy[i*align], next_src_item, align);
+                        //printf("tm_write next_src \t %p\n", (int) &txn->local_copy[i*align]);
+                    }
+                    else{
+                        tm_abort(shared, tx); // HERE
+                        return false;
+                    }
+                }
+                else if(((int)txn->writeset[i])==1){
+                    //printf("<tm_write> already in writeset \n");
+                    memcpy(&txn->local_copy[i*align], next_src_item, align); // if TX already holds the lock then just write the small fragment in its local_copy
+                    //printf("<tm_write> in writeset memcopy successful \n");
+                }
+            //update next_item
+            next_src_item = align + (char *) next_src_item; // update position "+1"
+        }
+        // perhaps need to update the ts for all to the highest found during the iterations
+        //memcpy(&txn->local_copy[mem_index*align], source, size); // need to be sure that local_copy in memory has distance from one item to the other == align
+    }
     return true;
 }
 
